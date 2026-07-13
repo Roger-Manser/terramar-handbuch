@@ -67,6 +67,10 @@ mark{background:var(--mark);color:var(--markink);border-radius:3px;padding:0 2px
 .res .snip{font-size:14px;color:var(--muted);margin-top:3px;line-height:1.45}
 .res .where{font-size:12px;color:var(--copper);font-weight:700;text-transform:uppercase;letter-spacing:.4px}
 .emptymsg{text-align:center;color:var(--muted);padding:40px 10px;font-size:15px}
+.srch-div{font-size:12px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;
+  color:var(--muted);padding:16px 4px 6px;border-top:1px solid var(--line);margin-top:6px}
+.mbadge{display:inline-block;margin-left:6px;background:var(--caution);color:#fff;
+  font-size:11px;font-weight:700;padding:1px 6px;border-radius:8px;vertical-align:middle}
 .toolbar{display:flex;gap:8px;margin:0 0 14px;flex-wrap:wrap}
 .chip{background:var(--card);border:1px solid var(--line);border-radius:20px;padding:7px 14px;font-size:13.5px;
   cursor:pointer;color:var(--ink);font-weight:600}
@@ -295,29 +299,78 @@ function renderSearch(q) {
   const terms = norm(q).split(/\s+/).filter(t => t.length >= 2);
   hlTerms = terms;
   if (!terms.length) return renderHome();
-  const hitsTitle = [], hitsBody = [];
+
+  // Progressive multi-term scoring:
+  // Term[0] must match (primary filter).
+  // Each additional term that also matches adds to the score.
+  // Results with more matching terms appear first.
+  // Within same score: title matches before body; then by match position.
+  const scored = [];
   flat.forEach(f => {
-    const inTitle = terms.every(t => f.ntitle.includes(t) || norm(f.topic).includes(t));
-    const positions = terms.map(t => f.nplain.indexOf(t));
-    const inBody = positions.every(p => p >= 0);
-    if (inTitle) hitsTitle.push({ f, pos: 0 });
-    else if (inBody) hitsBody.push({ f, pos: Math.min(...positions.filter(p => p >= 0)) });
+    const ntopic = norm(f.topic);
+    // Term 0 must match somewhere
+    const t0 = terms[0];
+    const inTitle0 = f.ntitle.includes(t0) || ntopic.includes(t0);
+    const pos0 = f.nplain.indexOf(t0);
+    if (!inTitle0 && pos0 < 0) return; // primary term missing → skip
+
+    // Score: count how many terms match (title counts double)
+    let score = 0;
+    let firstPos = inTitle0 ? 0 : pos0;
+    for (const t of terms) {
+      const inT = f.ntitle.includes(t) || ntopic.includes(t);
+      const inB = f.nplain.includes(t);
+      if (inT) score += 2;
+      else if (inB) score += 1;
+      if (!inT && inB) {
+        const p = f.nplain.indexOf(t);
+        if (firstPos === 0 || p < firstPos) firstPos = p;
+      }
+    }
+    const allMatch = terms.every(t => f.ntitle.includes(t) || ntopic.includes(t) || f.nplain.includes(t));
+    scored.push({ f, score, firstPos, allMatch, inTitle: inTitle0 });
   });
-  const results = hitsTitle.concat(hitsBody).slice(0, 80);
-  let html = `<div class="crumb">${results.length} Treffer für «${esc(q)}»${hitsTitle.length ? ' · Titel-Treffer zuerst' : ''}</div>`;
+
+  // Sort: allMatch first, then score DESC, then title hits before body, then position ASC
+  scored.sort((a, b) =>
+    (b.allMatch - a.allMatch) || (b.score - a.score) || (b.inTitle - a.inTitle) || (a.firstPos - b.firstPos)
+  );
+
+  const allMatchCount = scored.filter(r => r.allMatch).length;
+  const partialCount  = scored.length - allMatchCount;
+  const results = scored.slice(0, 80);
+
+  let crumb = `${scored.length} Treffer für «${esc(q)}»`;
+  if (terms.length > 1 && partialCount > 0 && allMatchCount > 0)
+    crumb += ` · ${allMatchCount} alle Begriffe · ${partialCount} nur «${esc(terms[0])}»`;
+  else if (terms.length > 1 && allMatchCount === 0 && partialCount > 0)
+    crumb += ` · nur «${esc(terms[0])}» gefunden`;
+
+  let html = `<div class="crumb">${crumb}</div>`;
   if (!results.length) {
-    html += '<div class="emptymsg">Keine Treffer.<br>Tipp: kürzere oder andere Begriffe versuchen<br>(z.B. «Reifen» statt «Reifendruckkontrolle»).</div>';
+    html += `<div class="emptymsg">Keine Treffer für «${esc(terms[0])}».<br>Tipp: kürzeren Begriff versuchen.</div>`;
   } else {
+    // Divider between full-match and partial-match groups
+    let shownDivider = allMatchCount === 0 || allMatchCount >= results.length;
     html += '<div class="card">';
-    results.forEach(r => {
+    results.forEach((r, idx) => {
       const f = r.f;
-      let snip = esc(snippet(f.plain, r.pos, terms[0].length));
+      // Divider before partial-match group
+      if (!shownDivider && !r.allMatch) {
+        html += `</div><div class="srch-div">Nur «${esc(terms[0])}» gefunden</div><div class="card">`;
+        shownDivider = true;
+      }
+      let snip = esc(snippet(f.plain, r.firstPos, terms[0].length));
       terms.forEach(t => {
         const re = new RegExp('(' + t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/ss/g, '(?:ss|ß)') + ')', 'gi');
         snip = snip.replace(re, '<mark>$1</mark>');
       });
+      // Show which terms matched as tag
+      const matchedTerms = terms.filter(t => f.ntitle.includes(t) || norm(f.topic).includes(t) || f.nplain.includes(t));
+      const badge = (terms.length > 1 && matchedTerms.length < terms.length)
+        ? `<span class="mbadge">${matchedTerms.length}/${terms.length}</span>` : '';
       html += `<div class="row res" onclick="nav('#t/${f.ci}/${f.ti}/${f.si}')"><div class="lbl">
-        <div class="where">${esc(f.chapter)} › ${esc(f.topic)}</div>
+        <div class="where">${esc(f.chapter)} › ${esc(f.topic)}${badge}</div>
         <div class="t">${esc(f.title)} <span class="pg">S. ${f.page}</span></div>
         <div class="snip">${snip}</div></div><span class="chev">›</span></div>`;
     });
